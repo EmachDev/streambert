@@ -10,6 +10,48 @@ const os = require("os");
 
 let _updateAbortController = null;
 
+// ── Trusted release sources for the auto-updater ──────────────────────────────
+// Same validation logic applies to every entry below, adding a new source
+// means adding a row here, not a new code path.
+//
+// IMPORTANT: GitHub and Codeberg use completely different asset URL structures:
+//   GitHub:   https://github.com/<owner>/<repo>/releases/download/<tag>/<file>
+//   Codeberg: https://codeberg.org/attachments/<uuid>
+//             (Gitea stores release attachments under /attachments/, not under the repo path)
+const TRUSTED_UPDATE_SOURCES = [
+  {
+    id: "github",
+    origin: "https://github.com",
+    // Must match the full repo path so an attacker can't use
+    // a different repo on github.com to serve a malicious binary.
+    pathPrefix: "/truelockmc/streambert/releases/download/",
+    redirectHosts: [
+      "github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com",
+    ],
+  },
+  {
+    id: "codeberg",
+    origin: "https://codeberg.org",
+    // Codeberg (Gitea) release assets are served from /attachments/<uuid>.
+    // The UUID is random and unguessable.
+    pathPrefix: "/attachments/",
+    redirectHosts: ["codeberg.org"],
+  },
+];
+
+// Returns the matching trusted source for a parsed URL, or null.
+function findTrustedUpdateSource(parsedUrl) {
+  return (
+    TRUSTED_UPDATE_SOURCES.find(
+      (s) =>
+        parsedUrl.origin === s.origin &&
+        parsedUrl.pathname.startsWith(s.pathPrefix),
+    ) || null
+  );
+}
+
 function register(getMainWindow, { writeSecretMigration }) {
   // ── Open file at specific timestamp in mpv / VLC ─────────────────────────
   ipcMain.handle(
@@ -210,20 +252,17 @@ function register(getMainWindow, { writeSecretMigration }) {
 
   ipcMain.handle("download-and-install-update", async (_, { url, format }) => {
     try {
-
-      const ALLOWED_FORMATS = ["exe", "deb", "pacman", "dmg", "dmg_arm64", "appimage"];
+      const ALLOWED_FORMATS = [
+        "exe",
+        "deb",
+        "pacman",
+        "dmg",
+        "dmg_arm64",
+        "appimage",
+      ];
       if (!ALLOWED_FORMATS.includes(format)) {
         return { ok: false, error: "Invalid format" };
       }
-
-      const TRUSTED_ORIGIN   = "https://github.com";
-      const TRUSTED_PATH     = "/truelockmc/streambert/releases/download/";
-      // Domains that are allowed as redirect targets (GitHub CDN).
-      const ALLOWED_REDIRECT_HOSTS = [
-        "github.com",
-        "objects.githubusercontent.com",
-        "release-assets.githubusercontent.com",
-      ];
 
       let parsed;
       try {
@@ -232,22 +271,26 @@ function register(getMainWindow, { writeSecretMigration }) {
         return { ok: false, error: "Invalid URL" };
       }
 
-      if (
-        parsed.origin !== TRUSTED_ORIGIN ||
-        !parsed.pathname.startsWith(TRUSTED_PATH)
-      ) {
+      // Same check for every trusted source (GitHub, Codeberg, ...)
+      const trustedSource = findTrustedUpdateSource(parsed);
+      if (!trustedSource) {
         return { ok: false, error: "Unauthorized update source" };
       }
+      const ALLOWED_REDIRECT_HOSTS = trustedSource.redirectHosts;
 
       _updateAbortController = new AbortController();
       const { signal } = _updateAbortController;
 
       const ext =
-        format === "exe" ? ".exe"
-        : format === "deb" ? ".deb"
-        : format === "pacman" ? ".pacman"
-        : format === "dmg" ? ".dmg"
-        : ".AppImage";
+        format === "exe"
+          ? ".exe"
+          : format === "deb"
+            ? ".deb"
+            : format === "pacman"
+              ? ".pacman"
+              : format === "dmg"
+                ? ".dmg"
+                : ".AppImage";
       const destPath = path.join(os.tmpdir(), `streambert-update${ext}`);
 
       await new Promise((resolve, reject) => {
@@ -266,7 +309,7 @@ function register(getMainWindow, { writeSecretMigration }) {
           }
           if (!ALLOWED_REDIRECT_HOSTS.includes(reqParsed.hostname)) {
             return reject(
-              new Error(`Untrusted redirect host: ${reqParsed.hostname}`)
+              new Error(`Untrusted redirect host: ${reqParsed.hostname}`),
             );
           }
 
@@ -469,9 +512,84 @@ function register(getMainWindow, { writeSecretMigration }) {
     _updateAbortController?.abort();
   });
 
+  // ── Proxy release-note images through the main process ───────────────────
+  // Codeberg (and GitHub) release images are blocked by Electron's renderer
+  // CSP. Fetch them here in the main process and return a base64 data-URI.
+  const ALLOWED_IMAGE_HOSTS = new Set([
+    "codeberg.org",
+    "github.com",
+    "user-images.githubusercontent.com",
+    "private-user-images.githubusercontent.com",
+    "objects.githubusercontent.com",
+  ]);
+  const IMAGE_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB
+
+  const fetchImageSecure = (url, resolve, redirectDepth = 0) => {
+    if (redirectDepth > 1) return resolve(null);
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return resolve(null);
+    }
+    if (parsed.protocol !== "https:") return resolve(null);
+    if (!ALLOWED_IMAGE_HOSTS.has(parsed.hostname)) return resolve(null);
+
+    https
+      .get(
+        url,
+        { headers: { "User-Agent": "Streambert-ReleaseNotes" } },
+        (res) => {
+          if (
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            res.resume();
+            const next = res.headers.location.startsWith("http")
+              ? res.headers.location
+              : new URL(res.headers.location, url).toString();
+            return fetchImageSecure(next, resolve, redirectDepth + 1);
+          }
+          if (res.statusCode !== 200) {
+            res.resume();
+            return resolve(null);
+          }
+          const ct = res.headers["content-type"] || "";
+          if (!ct.startsWith("image/")) {
+            res.resume();
+            return resolve(null);
+          }
+
+          const chunks = [];
+          let total = 0;
+          res.on("data", (c) => {
+            total += c.length;
+            if (total > IMAGE_SIZE_LIMIT) {
+              res.destroy();
+              return resolve(null);
+            }
+            chunks.push(c);
+          });
+          res.on("end", () =>
+            resolve(
+              `data:${ct};base64,${Buffer.concat(chunks).toString("base64")}`,
+            ),
+          );
+          res.on("error", () => resolve(null));
+        },
+      )
+      .on("error", () => resolve(null));
+  };
+
+  ipcMain.handle(
+    "fetch-release-image",
+    (_, { url }) => new Promise((resolve) => fetchImageSecure(url, resolve)),
+  );
+
   // ── Query video progress across all webview frames ────────────────────────
   // executeJavaScript on a webview only reaches the top frame.
-  // VidSrc / 2embed nest the player inside cross-origin iframes, so we iterate
+  // VidSrc / 2embed nest the player inside cross-origin iframes, iterate
   // all frames from the main process where same-origin restrictions don't apply.
   ipcMain.handle("query-video-progress", async (_, webContentsId) => {
     try {
